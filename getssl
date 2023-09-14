@@ -721,7 +721,7 @@ check_config() { # check the config files for all obvious errors
     if [[ "$(grep "^${d}$" "$tmplist")" = "$d" ]]; then
       info "${DOMAIN}: $d appears to be duplicated in domain, SAN list"
       config_errors=true
-    elif [[ "$d" != "${d##\*.}" ]] && [[ "$VALIDATE_VIA_DNS" != "true" ]]; then
+    elif [[ "$d" != "${d##\*.}" ]] && [[ "$VALIDATE_VIA_DNS" != "true" ]] && [[ "$VALIDATE_VIA_EAB" != "true" ]]; then
       info "${DOMAIN}: cannot use http-01 validation for wildcard domains"
       config_errors=true
     else
@@ -734,7 +734,7 @@ check_config() { # check the config files for all obvious errors
       DOMAIN_ACL="${ACL[$dn]}"
     fi
 
-    if [[ $VALIDATE_VIA_DNS != "true" ]]; then # using http-01 challenge
+    if [[ $VALIDATE_VIA_DNS != "true" ]] && [[ $VALIDATE_VIA_EAB != "true" ]]; then # using http-01 challenge
       if [[ -z "${DOMAIN_ACL}" ]]; then
         info "${DOMAIN}: ACL location not specified for domain $d in $DOMAIN_DIR/getssl.cfg"
         config_errors=true
@@ -1408,7 +1408,10 @@ for d in "${alldomains[@]}"; do
     ((dn++))
   else
     PREVIOUSLY_VALIDATED="false"
-    if [[ $VALIDATE_VIA_DNS == "true" ]]; then # set up the correct DNS token for verification
+    if [[ $VALIDATE_VIA_EAB == "true" ]]; then
+      # do nothing
+      debug "doing nothing"
+    elif [[ $VALIDATE_VIA_DNS == "true" ]]; then # set up the correct DNS token for verification
       if [[ $API -eq 1 ]]; then
         # get the dns component of the ACME response
         # get the token and uri from the dns component
@@ -1888,23 +1891,20 @@ get_cr() { # get curl response
 }
 
 get_eab_json() { # calculate json block for external account bindings, v2 only
-  if [ ${#EAB_PARAMS[@]} -eq 1 ]; then
-    # single param, assume file path and read into array
-    debug "Using EAB FILE ${EAB_PARAMS[0]}"
-    [[ -s "${EAB_PARAMS[0]}" ]] || error_exit "missing path ${EAB_PARAMS[0]} for eab file"
-    # shellcheck disable=SC2207
-    EAB_PARAMS=( $(cat "${EAB_PARAMS[0]}") )
+  if [[ "${EAB_HMAC_FILE}" ]]; then
+    debug "Using EAB HMAC FILE ${EAB_HMAC_FILE}"
+    [[ -s "${EAB_HMAC_FILE}" ]] || error_exit "missing path '${EAB_HMAC_FILE}' for eab hmac file"
+    EAB_HMAC=( $(cat "${EAB_HMAC_FILE}") )
   fi
-  if [ ${#EAB_PARAMS[@]} -eq 2 ]; then
-    # two params - kid and mac key from CA
-    debug "Using EAB KID ${EAB_PARAMS[0]}"
-    debug "Using EAB HMAC ${EAB_PARAMS[1]}"
-    eab_protected="{\"alg\": \"HS256\", \"kid\": \"${EAB_PARAMS[0]}\", \"url\": \"${URL_newAccount}\"}"
+  if [[ "${EAB_REQUIRED}" && "${EAB_HMAC}" && "${EAB_KID}" ]]; then
+    debug "Using EAB KID ${EAB_KID}"
+    debug "Using EAB HMAC ${EAB_HMAC}"
+    eab_protected="{\"alg\": \"HS256\", \"kid\": \"${EAB_KID}\", \"url\": \"${URL_newAccount}\"}"
     eab_protected64=$(printf '%s' "${eab_protected}" | urlbase64)
     eab_payload="${jwk}"
     eab_payload64=$(printf '%s' "${eab_payload}" | urlbase64)
     signing_input=$(printf '%s' "${eab_protected64}.${eab_payload64}")
-    keyhex=$(printf '%s' "${EAB_PARAMS[1]}" | base64url_decode | xxd -p | tr -d '\n')
+    keyhex=$(printf '%s' "${EAB_HMAC}" | base64url_decode | xxd -p | tr -d '\n')
     debug "SIGN INPUT $signing_input"
     debug "HMAC-SHA256 HEXKEY $keyhex"
     eab_signature=$(printf '%s' "$signing_input" | openssl dgst -sha256 -mac hmac -macopt "hexkey:${keyhex}" -binary | urlbase64)
@@ -2286,6 +2286,8 @@ obtain_ca_resource_locations()
     URL_newNonce=$(echo "$ca_all_loc" | grep "newNonce" | awk -F'"' '{print $4}')
     URL_newOrder=$(echo "$ca_all_loc" | grep "newOrder" | awk -F'"' '{print $4}')
     URL_revoke=$(echo "$ca_all_loc" | grep "revokeCert" | awk -F'"' '{print $4}')
+
+    EAB_REQUIRED=$(echo "$ca_all_loc" | grep "externalAccountRequired")
 
     if [[ -n "$URL_new_reg" ]] || [[ -n "$URL_newAccount" ]]; then
       break
@@ -3401,6 +3403,9 @@ fi
 # currently the code registers every time, and gets an "already registered" back if it has been.
 get_signing_params "$ACCOUNT_KEY"
 
+# get any EAB authentication json
+get_eab_json
+
 info "Registering account"
 # send the request to the ACME server.
 if [[ $API -eq 1 ]]; then
@@ -3411,11 +3416,18 @@ if [[ $API -eq 1 ]]; then
   fi
   send_signed_request "$URL_new_reg"  "$regjson"
 elif [[ $API -eq 2 ]]; then
+  regjson='{"termsOfServiceAgreed": true'
+
   if [[ "$ACCOUNT_EMAIL" ]] ; then
-  	regjson='{"termsOfServiceAgreed": true, "contact": ["mailto: '$ACCOUNT_EMAIL'"]}'
-  else
-  	regjson='{"termsOfServiceAgreed": true}'
+    regjson=$regjson', "contact": ["mailto: '$ACCOUNT_EMAIL'"]'
   fi
+
+  if [[ "$EAB_JSON" ]] ; then
+    regjson=$regjson', "externalAccountBinding": '$EAB_JSON
+  fi
+
+  regjson=$regjson'}'
+
   send_signed_request "$URL_newAccount"  "$regjson"
 else
 	debug "cant determine account API"
